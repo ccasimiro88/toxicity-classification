@@ -1,0 +1,154 @@
+from transformers import AutoConfig, AutoTokenizer, AutoModelForSequenceClassification
+from transformers import TrainingArguments, Trainer
+from datasets import load_dataset
+import torch
+import numpy as np
+from sklearn.metrics import classification_report, f1_score
+import pandas as pd
+import sys
+import os
+from collections import defaultdict
+import torch.nn as nn
+
+# for reproducibility
+seed = 33
+
+# Load data with the "datasets" library to create the model features
+def load_data(data_files):
+    dataset = load_dataset("csv", data_files=data_files)
+
+    # extract labels to predict
+    labels = dataset["train"].unique("label")
+    return dataset, labels
+
+# train the model and eval on the test set
+def train_and_eval(dataset, labels, model_name, output_dir):
+    # set labels configuration
+    id2label = {0: 'Nulo', 1: 'Decibelios_suaves', 2: 'Decibelios_fuertes'}
+    label2id = {'Nulo': 0, 'Decibelios_suaves': 1, 'Decibelios_fuertes': 2}
+    config = AutoConfig.from_pretrained(model_name,
+                                        num_labels=len(labels),
+                                        id2label=id2label,
+                                        label2id=label2id)
+
+    model = AutoModelForSequenceClassification.from_pretrained(model_name,
+                                                               config=config)
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+
+
+    # setup trainer with balance loss to build the training loop
+    class BalancedClassificationTrainer(Trainer):
+        def __init__(self, weights, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.weights = weights
+
+        def compute_loss(self, model, inputs, return_outputs=False):
+            labels = inputs.get("labels")
+            outputs = model(**inputs)
+            logits = outputs.get("logits")
+            # use weights to balance loss per class
+            loss_fct = nn.CrossEntropyLoss(torch.tensor(weights).to(device=self.args.device))
+            loss = loss_fct(logits.view(-1, self.model.config.num_labels), labels.view(-1))
+            return (loss, outputs) if return_outputs else loss
+
+   # compute pos_weights
+    labels_freq = defaultdict(int)
+    for ex in dataset['train']:
+        labels_freq[ex['label']] += 1
+
+    weights = [len(dataset['train'])/labels_freq[label] for label in labels_freq.keys()]
+    
+    # tokenize examples to construct the model features
+    def tokenize(examples):
+        return tokenizer(examples['text'],
+                         max_length=128,
+                         truncation=True,
+                         padding=True)
+
+    # remove useless columns
+    dataset_tokenized = dataset.map(tokenize,
+                                    batched=True,
+                                    remove_columns=['Unnamed: 0', 'twitterId'],
+                                    desc="tokenizing dataset")
+
+    train_dataset = dataset_tokenized['train']
+    test_dataset = dataset_tokenized['test']
+
+    # defines training arguments
+    training_args = TrainingArguments(output_dir=output_dir,
+                                      per_device_train_batch_size=6,
+                                      per_device_eval_batch_size=6,
+                                      gradient_accumulation_steps=2,
+                                      num_train_epochs=6,
+                                      save_strategy="no",
+                                      logging_strategy="steps",
+                                      logging_steps=50,
+                                      logging_dir=f"{output_dir}/tb",
+                                      seed=seed,
+                                      )
+
+    trainer = BalancedClassificationTrainer(model=model,
+                      tokenizer=tokenizer,
+                      args=training_args,
+                      train_dataset=train_dataset,
+                      eval_dataset=test_dataset,
+                      weights=weights,
+                      )
+
+
+    # start the training
+    train_results = trainer.train()
+
+    # save the model
+    trainer.save_model()
+
+    trainer.log_metrics("train", train_results.metrics)
+    trainer.save_metrics("train", train_results.metrics)
+    trainer.save_state()
+
+    # compute detailed metrics for proper evaluation of the best model
+    def metrics(model_preds):
+      # evaluate the model with several metrics suitable for classification
+      # and get predictions
+      refs = model_preds.label_ids
+      preds = model_preds.predictions
+      preds = np.argmax(preds, axis=1)
+      metrics = classification_report(refs, preds, 
+                                       output_dict=True)
+
+      return metrics
+
+    trainer.compute_metrics = metrics
+    eval_metrics = trainer.evaluate()
+
+    # store metrics in a table to better visualization
+    df_metrics = pd.DataFrame.from_dict(eval_metrics)
+    df_metrics.columns = df_metrics.columns.str.replace("eval_", "")
+    df_metrics.drop(columns=['runtime', 'steps_per_second', 'samples_per_second', 'epoch'], inplace=True)
+    df_metrics.to_csv(f"{output_dir}/eval_scores.csv")
+
+    return eval_metrics
+
+
+if __name__ == '__main__':
+
+    model_name = sys.argv[1]
+
+    # Load data
+    train_file = "decibelios_train_data.csv"
+    test_file = "decibelios_test_data.csv"
+
+    data_files = {"train": train_file,
+                  "test": test_file}
+
+    dataset, labels = load_data(data_files)
+
+    # Training Roberta-base-bne
+    output_dir = f"classifiers/{model_name}_balanced_loss"
+
+    metrics = train_and_eval(dataset,
+                             labels,
+                             model_name,
+                             output_dir)
+
